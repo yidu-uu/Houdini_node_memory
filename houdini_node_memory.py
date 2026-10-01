@@ -1,6 +1,7 @@
 """
 Houdini Node Library Manager
-基于文件系统的节点组预设库，支持分类、保存、更新、放置、重命名、删除、拖拽移动、固定面板、备注、撤销/恢复、截图保存。
+基于文件系统的节点组预设库，支持分类、保存、更新、放置、重命名、删除、拖拽移动、固定面板、备注、撤销/恢复、截图保存、搜索过滤、备份/恢复、文件夹导入。
+- 兼容 PySide2(Qt5) 与 PySide6(Qt6)：Houdini ≤20.0/标准20.5 用 PySide2，20.5 Qt6 构建及 21.0/22.0 用 PySide6。
 - 修复：自动清理旧数据中 file 字段的 .cpio 后缀，避免路径重复扩展名。
 - 组为叶子节点，不能作为文件夹接受其他项。
 - 撤销/恢复最多保留 20 步操作。
@@ -36,6 +37,23 @@ def _qt_exec(widget, *args):
     if hasattr(widget, "exec"):
         return widget.exec(*args)
     return widget.exec_(*args)
+
+
+# 元数据 schema 版本号，写入 .meta.json 顶层，便于后续迁移兼容
+META_VERSION = 2
+
+# 常用通用标签：始终出现在标签勾选下拉中，方便直接选用（用户仍可自定义新标签）。
+# 顺序即显示顺序，可按需增删。
+DEFAULT_TAGS = [
+    # 常用度 / 状态
+    "常用", "高频", "收藏", "模板", "草稿", "成品",
+    # 模块 / 领域
+    "建模", "特效", "渲染", "灯光", "材质", "着色", "合成", "动画", "绑定",
+    # 程序化类型
+    "程序化", "地形", "布料", "毛发", "粒子", "流体", "破碎",
+    # 功能角色
+    "生成器", "修改器", "工具",
+]
 
 
 
@@ -484,6 +502,132 @@ class ClickableLabel(QtWidgets.QLabel):
         super().mousePressEvent(event)
 
 
+# 可缩放、可拖拽的图片查看视图（用于放大截图预览）
+class ZoomableImageView(QtWidgets.QGraphicsView):
+    """支持滚轮缩放、拖拽平移的图片视图；首次显示时自动适应窗口。"""
+
+    zoomChanged = QtCore.Signal()
+
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self._scene = QtWidgets.QGraphicsScene(self)
+        self._item = self._scene.addPixmap(pixmap)
+        self.setScene(self._scene)
+        self.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+        self.setDragMode(QtWidgets.QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
+        self._fitted = False
+
+    def wheelEvent(self, event):
+        """滚轮缩放：上滚放大、下滚缩小，以鼠标位置为锚点。"""
+        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
+        self.zoom_by(factor)
+        event.accept()
+
+    def zoom_by(self, factor):
+        """按比例缩放（相对当前状态）。"""
+        self.scale(factor, factor)
+        self.zoomChanged.emit()
+
+    def set_zoom(self, z):
+        """重置为相对原图的绝对缩放比例（1.0 表示 100%）。"""
+        self.resetTransform()
+        self.scale(z, z)
+        self.zoomChanged.emit()
+
+    def fit(self):
+        """缩放以完整显示图片（保持宽高比）。"""
+        self.fitInView(self._item, QtCore.Qt.KeepAspectRatio)
+        self.zoomChanged.emit()
+
+    def current_zoom(self):
+        """返回当前水平缩放系数（用于显示百分比）。"""
+        return self.transform().m11()
+
+    def showEvent(self, event):
+        """首次显示时自动适应窗口。"""
+        super().showEvent(event)
+        if not self._fitted:
+            self._fitted = True
+            self.fit()
+
+
+# 多选下拉框：用于以勾选形式添加/筛选标签，输入框显示已选标签
+class CheckableComboBox(QtWidgets.QComboBox):
+    """下拉列表内每项带勾选框，点击整行即可切换勾选，勾选结果以逗号文本显示。"""
+    selectionChanged = QtCore.Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._model = QtGui.QStandardItemModel(self)
+        self.setModel(self._model)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("选择标签…")
+        self._block = False
+        self._all = []
+        self._checked = []
+        self._model.itemChanged.connect(self._on_item_changed)
+        # 让点击整行即可切换勾选，并保持下拉展开
+        self.view().viewport().installEventFilter(self)
+
+    def set_tags(self, all_tags, checked):
+        """重建候选列表并设置勾选状态（不触发 selectionChanged）。"""
+        self._block = True
+        self._all = []
+        for t in (all_tags or []):
+            if t not in self._all:
+                self._all.append(t)
+        self._checked = [t for t in (checked or []) if t in self._all]
+        self._model.clear()
+        for t in self._all:
+            item = QtGui.QStandardItem(t)
+            item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+            item.setData(
+                QtCore.Qt.Checked if t in self._checked else QtCore.Qt.Unchecked,
+                QtCore.Qt.CheckStateRole,
+            )
+            self._model.appendRow(item)
+        self._block = False
+        self._refresh_text()
+
+    def checked_tags(self):
+        return list(self._checked)
+
+    def _on_item_changed(self, item):
+        if self._block:
+            return
+        tag = item.text()
+        if item.checkState() == QtCore.Qt.Checked:
+            if tag not in self._checked:
+                self._checked.append(tag)
+        else:
+            if tag in self._checked:
+                self._checked.remove(tag)
+        self._refresh_text()
+        self.selectionChanged.emit(self.checked_tags())
+
+    def _refresh_text(self):
+        if self._checked:
+            self.lineEdit().setText(", ".join(self._checked))
+        else:
+            self.lineEdit().clear()
+
+    def eventFilter(self, obj, event):
+        """点击整行切换勾选并保持下拉展开。"""
+        if obj is self.view().viewport() and event.type() == QtCore.QEvent.MouseButtonRelease:
+            index = self.view().indexAt(event.pos())
+            if index.isValid():
+                item = self._model.itemFromIndex(index)
+                if item.flags() & QtCore.Qt.ItemIsUserCheckable:
+                    item.setCheckState(
+                        QtCore.Qt.Unchecked if item.checkState() == QtCore.Qt.Checked else QtCore.Qt.Checked
+                    )
+                    return True
+        return super().eventFilter(obj, event)
+
+
 # 主面板
 # ============================================================
 class NodeLibraryPanel(QtWidgets.QWidget):
@@ -499,12 +643,15 @@ class NodeLibraryPanel(QtWidgets.QWidget):
 
         self._current_note_item = None
         self._note_dirty = False
+        self._current_tag_item = None
         self._screenshot_overlay = None  # 截图覆盖层引用，防止被垃圾回收
         self._screenshot_target = None   # 当前截图对应的节点组数据
         self._search_text = ""           # 搜索关键词（空表示不过滤）
+        self._tag_filter = []            # 标签筛选（空表示不过滤）
 
         self._init_ui()
         self.refresh_tree()
+        self._refresh_tag_pools()
         
         saved_expanded = self._load_initial_expanded_state()
         self._restore_expanded_state(saved_expanded)
@@ -516,12 +663,16 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         self.btn_screenshot.clicked.connect(self.capture_screenshot)
         self.btn_backup.clicked.connect(self.backup_library)
         self.btn_restore.clicked.connect(self.restore_library)
+        self.btn_import.clicked.connect(self.import_from_folder)
         self.tree.customContextMenuRequested.connect(self.on_context_menu)
         self.tree.currentItemChanged.connect(self.on_tree_selection_changed)
         self.note_edit.textChanged.connect(self._on_note_text_changed)
+        self.tag_selector.selectionChanged.connect(self._on_tag_selection_changed)
+        self.tag_add_btn.clicked.connect(self._on_add_custom_tag)
         self.thumb_label.customContextMenuRequested.connect(self.on_thumb_context_menu)
         self.thumb_label.clicked.connect(self._open_thumb_preview)
         self.search_edit.textChanged.connect(self.on_search_changed)
+        self.tag_filter_selector.selectionChanged.connect(self._on_tag_filter_changed)
 
     # ---------- UI ----------
     def _init_ui(self):
@@ -533,10 +684,20 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
 
+        # 搜索行：搜索框 + 标签筛选框
+        search_row = QtWidgets.QHBoxLayout()
+        search_row.setSpacing(6)
+
         self.search_edit = QtWidgets.QLineEdit()
         self.search_edit.setPlaceholderText("搜索节点组（名称/备注）...")
         self.search_edit.setClearButtonEnabled(True)
-        left_layout.addWidget(self.search_edit)
+        search_row.addWidget(self.search_edit, 1)
+
+        self.tag_filter_selector = CheckableComboBox()
+        self.tag_filter_selector.setToolTip("勾选标签进行筛选（多选为 AND 关系）")
+        search_row.addWidget(self.tag_filter_selector, 1)
+
+        left_layout.addLayout(search_row)
 
         self.tree = NodeTreeWidget(self)
         self.tree.setHeaderHidden(False)
@@ -549,7 +710,8 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         self.tree.setDropIndicatorShown(True)
         self.tree.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
         self.tree.setDefaultDropAction(QtCore.Qt.MoveAction)
-        self.tree.setIconSize(QtCore.QSize(192, 192))
+        # 树图标尺寸：Qt6 中标准图标为矢量，会严格按此尺寸渲染，故设常规大小（原 192 为遗留错误）。
+        self.tree.setIconSize(QtCore.QSize(18, 18))
         left_layout.addWidget(self.tree, 1)
 
         main_layout.addWidget(left_widget, 1)
@@ -565,6 +727,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         btn_screenshot = QtWidgets.QPushButton("截图")
         btn_backup = QtWidgets.QPushButton("备份")
         btn_restore = QtWidgets.QPushButton("恢复")
+        btn_import = QtWidgets.QPushButton("导入")
 
         note_label = QtWidgets.QLabel("备注")
         note_edit = QtWidgets.QTextEdit()
@@ -596,6 +759,19 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         right_layout.addWidget(note_label)
         right_layout.addLayout(note_row, 1)
 
+        tag_label = QtWidgets.QLabel("标签")
+        tag_selector = CheckableComboBox()
+        tag_selector.setEnabled(False)
+        tag_add_btn = QtWidgets.QPushButton("＋ 自定义")
+        tag_add_btn.setEnabled(False)
+        tag_add_btn.setToolTip("添加自定义标签")
+        tag_row = QtWidgets.QHBoxLayout()
+        tag_row.setSpacing(6)
+        tag_row.addWidget(tag_selector, 1)
+        tag_row.addWidget(tag_add_btn, 0)
+        right_layout.addWidget(tag_label)
+        right_layout.addLayout(tag_row)
+
         # 库维护：备份 / 恢复（与节点组操作视觉分隔）
         sep = QtWidgets.QFrame()
         sep.setFrameShape(QtWidgets.QFrame.HLine)
@@ -605,6 +781,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         backup_row.setSpacing(6)
         backup_row.addWidget(btn_backup)
         backup_row.addWidget(btn_restore)
+        backup_row.addWidget(btn_import)
         right_layout.addLayout(backup_row)
 
         main_layout.addWidget(right_widget)
@@ -620,7 +797,10 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         self.btn_screenshot = btn_screenshot
         self.btn_backup = btn_backup
         self.btn_restore = btn_restore
+        self.btn_import = btn_import
         self.note_edit = note_edit
+        self.tag_selector = tag_selector
+        self.tag_add_btn = tag_add_btn
         self.thumb_label = thumb_label
         self.status_bar = status_bar
 
@@ -722,11 +902,9 @@ class NodeLibraryPanel(QtWidgets.QWidget):
 
     def _save_meta(self, folder, data):
         path = self._meta_path(folder)
-        print(f"DEBUG _save_meta(): Saving to {path}")
-        print(f"DEBUG _save_meta(): groups count = {len(data.get('groups', []))}")
+        data["version"] = META_VERSION
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"DEBUG _save_meta(): Saved successfully")
 
     def _get_children_order(self, folder):
         order = []
@@ -785,9 +963,13 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         expanded_paths = self._save_expanded_state()
 
         self.tree.clear()
-        # 以 invisibleRootItem 作为根，使 _populate_tree 中的 parent_item 始终是 QTreeWidgetItem，
-        # 从而支持 removeChild 剪枝（QTreeWidget 本身没有 removeChild）。
-        self._populate_tree(self.root_path, self.tree.invisibleRootItem())
+        if self._is_filtering():
+            # 搜索/标签过滤：仅列出命中的节点组（扁平列表，不显示文件夹）
+            self._populate_flat_results()
+        else:
+            # 以 invisibleRootItem 作为根，使 _populate_tree 中的 parent_item 始终是 QTreeWidgetItem，
+            # 从而支持 removeChild 剪枝（QTreeWidget 本身没有 removeChild）。
+            self._populate_tree(self.root_path, self.tree.invisibleRootItem())
 
         if saved_meta_ref:
             folder, fname = saved_meta_ref
@@ -795,8 +977,8 @@ class NodeLibraryPanel(QtWidgets.QWidget):
 
         self._restore_expanded_state(expanded_paths)
         self.update_status_bar()
-        # 搜索模式下不持久化折叠状态，避免被过滤结果覆盖用户原有的展开偏好
-        if not self._search_text.strip():
+        # 过滤模式下不持久化折叠状态，避免被过滤结果覆盖用户原有的展开偏好
+        if not self._is_filtering():
             self._save_expanded_state_to_file()
 
     def _load_initial_expanded_state(self):
@@ -849,7 +1031,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
                 file_id = entry["file"]
                 group_meta = groups_dict.get(file_id)
                 if group_meta and file_id not in processed_groups:
-                    if self._matches_search(group_meta.get("name", ""), group_meta.get("description", "")):
+                    if self._matches_filters(group_meta.get("name", ""), group_meta.get("description", ""), group_meta.get("tags", [])):
                         item = QtWidgets.QTreeWidgetItem(parent_item)
                         item.setText(0, group_meta["name"])
                         if "created" in group_meta:
@@ -913,7 +1095,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
                 file_id = entry[:-5]
                 if file_id not in processed_groups and file_id in groups_dict:
                     g = groups_dict[file_id]
-                    if self._matches_search(g.get("name", ""), g.get("description", "")):
+                    if self._matches_filters(g.get("name", ""), g.get("description", ""), g.get("tags", [])):
                         item = QtWidgets.QTreeWidgetItem(parent_item)
                         item.setText(0, g["name"])
                         if "created" in g:
@@ -931,6 +1113,33 @@ class NodeLibraryPanel(QtWidgets.QWidget):
 
         return added_any
 
+    def _populate_flat_results(self):
+        """过滤模式下：扁平列出所有命中的节点组（不显示文件夹层级）。"""
+        app_style = QtWidgets.QApplication.style()
+        root_item = self.tree.invisibleRootItem()
+        for dir_path, dirs, files in os.walk(self.root_path):
+            dirs[:] = [d for d in dirs if d != ".trash" and not d.startswith(".")]
+            meta = self._load_meta(dir_path)
+            groups_dict = {g["file"]: g for g in meta.get("groups", [])}
+            for f in files:
+                if not f.endswith(".cpio"):
+                    continue
+                file_id = f[:-5]
+                g = groups_dict.get(file_id)
+                if g and self._matches_filters(g.get("name", ""), g.get("description", ""), g.get("tags", [])):
+                    item = QtWidgets.QTreeWidgetItem(root_item)
+                    item.setText(0, g["name"])
+                    if "created" in g:
+                        item.setText(1, g["created"].split(" ")[0])
+                    item.setData(0, QtCore.Qt.UserRole, {
+                        "type": "group",
+                        "file": file_id,
+                        "folder": dir_path,
+                        "meta": g,
+                    })
+                    item.setIcon(0, app_style.standardIcon(QtWidgets.QStyle.SP_FileIcon))
+                    item.setFlags(item.flags() | QtCore.Qt.ItemIsDragEnabled)
+
     # ---------- 搜索 ----------
     def _matches_search(self, name, description):
         """判断名称/备注是否命中当前搜索关键词（不区分大小写）。"""
@@ -938,6 +1147,21 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         if not q:
             return True
         return q in (name or "").lower() or q in (description or "").lower()
+
+    def _matches_tag_filter(self, tags):
+        """判断节点组标签是否命中当前标签筛选（AND 语义，全部命中才算）。"""
+        if not self._tag_filter:
+            return True
+        tag_set = {t for t in (tags or [])}
+        return all(t in tag_set for t in self._tag_filter)
+
+    def _matches_filters(self, name, description, tags):
+        """搜索关键词与标签筛选需同时命中。"""
+        return self._matches_search(name, description) and self._matches_tag_filter(tags)
+
+    def _is_filtering(self):
+        """是否处于搜索或标签过滤状态。"""
+        return bool(self._search_text.strip() or self._tag_filter)
 
     def _focus_search(self):
         """聚焦搜索框并选中已有文本，便于直接输入新的关键词。"""
@@ -948,6 +1172,12 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         """搜索关键词变化时刷新树（过滤模式不保留选中项，避免误选）。"""
         self._auto_save_note_if_dirty()
         self._search_text = text
+        self.refresh_tree(select_last=False)
+        self.update_status_bar()
+
+    def _on_tag_filter_changed(self, tags):
+        """标签筛选变化时刷新树（多选标签为 AND 关系）。"""
+        self._tag_filter = list(tags)
         self.refresh_tree(select_last=False)
         self.update_status_bar()
 
@@ -979,6 +1209,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         self._auto_save_note_if_dirty()
         if not current:
             self._clear_note_ui()
+            self._clear_tag_ui()
             return
         data = current.data(0, QtCore.Qt.UserRole)
         if data and data["type"] == "group":
@@ -987,9 +1218,17 @@ class NodeLibraryPanel(QtWidgets.QWidget):
             self.note_edit.setEnabled(True)
             self._current_note_item = (data["folder"], data["file"])
             self._note_dirty = False
+            # 标签：以下拉勾选形式展示并加载当前组的标签
+            tags = data["meta"].get("tags", [])
+            all_tags = self._collect_all_tags()
+            self.tag_selector.set_tags(all_tags, tags)
+            self.tag_selector.setEnabled(True)
+            self.tag_add_btn.setEnabled(True)
+            self._current_tag_item = (data["folder"], data["file"])
             self._load_thumb(data)
         else:
             self._clear_note_ui()
+            self._clear_tag_ui()
 
     # ---------- 截图预览 ----------
     def _clear_thumb(self):
@@ -1021,7 +1260,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         self._clear_thumb()
 
     def _open_thumb_preview(self):
-        """点击预览口后，弹出对话框放大显示当前组的截图。"""
+        """点击预览口后，弹出可缩放对话框放大显示当前组的截图。"""
         data = self._selected_item_data()
         if not data or data["type"] != "group":
             return
@@ -1032,37 +1271,41 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         if pm.isNull():
             return
 
-        # 弹窗显示，缩放到可用屏幕 80% 以内并保持等比
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle(data["meta"].get("name", "截图预览"))
         dlg.setModal(True)
         layout = QtWidgets.QVBoxLayout(dlg)
 
+        view = ZoomableImageView(pm)
+        layout.addWidget(view, 1)
+
+        info_label = QtWidgets.QLabel()
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_zoom_in = QtWidgets.QPushButton("放大")
+        btn_zoom_out = QtWidgets.QPushButton("缩小")
+        btn_fit = QtWidgets.QPushButton("适应窗口")
+        btn_100 = QtWidgets.QPushButton("100%")
+        for b in (btn_zoom_in, btn_zoom_out, btn_fit, btn_100):
+            btn_row.addWidget(b)
+        layout.addWidget(info_label)
+        layout.addLayout(btn_row)
+
+        def update_info():
+            z = max(view.current_zoom(), 0.0001)
+            info_label.setText(f"尺寸：{pm.width()} × {pm.height()} px    缩放：{int(z * 100)}%")
+
+        btn_zoom_in.clicked.connect(lambda: view.zoom_by(1.25))
+        btn_zoom_out.clicked.connect(lambda: view.zoom_by(0.8))
+        btn_fit.clicked.connect(lambda: view.fit())
+        btn_100.clicked.connect(lambda: view.set_zoom(1.0))
+        view.zoomChanged.connect(update_info)
+
         screen = QtWidgets.QApplication.primaryScreen()
         avail = screen.availableGeometry()
-        max_w = int(avail.width() * 0.8)
-        max_h = int(avail.height() * 0.8)
-        scaled = pm
-        if pm.width() > max_w or pm.height() > max_h:
-            scaled = pm.scaled(
-                max_w, max_h,
-                QtCore.Qt.KeepAspectRatio,
-                QtCore.Qt.SmoothTransformation,
-            )
+        dlg.resize(int(avail.width() * 0.8), int(avail.height() * 0.8))
 
-        image_label = QtWidgets.QLabel()
-        image_label.setAlignment(QtCore.Qt.AlignCenter)
-        image_label.setPixmap(scaled)
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidget(image_label)
-        scroll.setWidgetResizable(True)
-        layout.addWidget(scroll, 1)
-
-        info_label = QtWidgets.QLabel(f"尺寸：{pm.width()} × {pm.height()} px")
-        layout.addWidget(info_label)
-
-        dlg.resize(min(max_w, pm.width()) + 40, min(max_h, pm.height()) + 60)
-        dlg.exec_()
+        update_info()
+        _qt_exec(dlg)
 
     def _on_note_text_changed(self):
         if self._current_note_item:
@@ -1093,6 +1336,103 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         
         update_tree_items(self.tree.invisibleRootItem())
         self._note_dirty = False
+
+    # ---------- 标签 ----------
+    @staticmethod
+    def _parse_tags(text):
+        """将逗号分隔的输入解析为去重后的标签列表（兼容中文逗号）。"""
+        result = []
+        for part in (text or "").replace("，", ",").split(","):
+            t = part.strip()
+            if t and t not in result:
+                result.append(t)
+        return result
+
+    def _collect_all_tags(self):
+        """遍历库收集所有已用标签，并前置默认常用标签（去重、排序）。"""
+        result = list(DEFAULT_TAGS)  # 默认标签固定在前，保持定义顺序
+        used = set()
+        for root, dirs, files in os.walk(self.root_path):
+            dirs[:] = [d for d in dirs if d != ".trash"]
+            meta_path = os.path.join(root, ".meta.json")
+            if not os.path.exists(meta_path):
+                continue
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for g in data.get("groups", []):
+                    for t in g.get("tags", []):
+                        used.add(t)
+            except Exception:
+                pass
+        # 追加用户自定义/已用但不在默认列表里的标签（排序后）
+        for t in sorted(used):
+            if t not in result:
+                result.append(t)
+        return result
+
+    def _refresh_tag_pools(self):
+        """刷新编辑与筛选两个下拉的候选标签（保留各自当前勾选）。"""
+        all_tags = self._collect_all_tags()
+        self.tag_filter_selector.set_tags(all_tags, self._tag_filter)
+        self.tag_selector.set_tags(all_tags, self.tag_selector.checked_tags())
+
+    def _save_current_group_tags(self, tags):
+        """将当前选中组的标签写入 meta.json 并就地更新树节点。"""
+        if not self._current_tag_item:
+            return
+        folder, file_id = self._current_tag_item
+        new_tags = list(tags)
+        meta = self._load_meta(folder)
+        for g in meta.get("groups", []):
+            if g.get("file") == file_id:
+                g["tags"] = new_tags
+                break
+        self._save_meta(folder, meta)
+
+        def update_tree_items(parent_item):
+            for i in range(parent_item.childCount()):
+                child = parent_item.child(i)
+                data = child.data(0, QtCore.Qt.UserRole)
+                if data and data["type"] == "group":
+                    if data["folder"] == folder and data["file"] == file_id:
+                        data["meta"]["tags"] = new_tags
+                        child.setData(0, QtCore.Qt.UserRole, data)
+                elif data and data["type"] == "folder":
+                    update_tree_items(child)
+
+        update_tree_items(self.tree.invisibleRootItem())
+
+    def _on_tag_selection_changed(self, tags):
+        """勾选/取消勾选标签时，立即保存到当前选中组。"""
+        self._save_current_group_tags(tags)
+
+    def _on_add_custom_tag(self):
+        """弹出输入框添加自定义标签到当前组（可一次输入多个，逗号分隔）。"""
+        if not self._current_tag_item:
+            return
+        text, ok = QtWidgets.QInputDialog.getText(
+            self, "添加自定义标签", "输入标签（多个用逗号分隔）："
+        )
+        if not ok:
+            return
+        new_tags = self._parse_tags(text)
+        if not new_tags:
+            return
+        merged = list(self.tag_selector.checked_tags())
+        for t in new_tags:
+            if t not in merged:
+                merged.append(t)
+        self.tag_selector.set_tags(self._collect_all_tags() + new_tags, merged)
+        self._save_current_group_tags(merged)
+        self._refresh_tag_pools()
+        self.status_bar.showMessage(f"已添加标签：{', '.join(new_tags)}", 4000)
+
+    def _clear_tag_ui(self):
+        self.tag_selector.set_tags([], [])
+        self.tag_selector.setEnabled(False)
+        self.tag_add_btn.setEnabled(False)
+        self._current_tag_item = None
 
     def closeEvent(self, event):
         self._auto_save_note_if_dirty()
@@ -1283,6 +1623,105 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         self.search_edit.clear()
         self.refresh_tree()
         self.status_bar.showMessage(f"已恢复 v{rec['version']}", 5000)
+
+    # ---------- 导入 ----------
+    def _read_meta_plain(self, folder):
+        """只读方式读取目录的 .meta.json（不写回，避免导入时改动源目录）。"""
+        path = os.path.join(folder, ".meta.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    data = {"groups": data, "order": []}
+                return data
+            except Exception:
+                pass
+        return {"groups": [], "order": []}
+
+    def import_from_folder(self):
+        """从选中的文件夹递归检索并导入节点组（保留子目录结构）。
+
+        适用场景：跨 Houdini 版本迁移后，旧库位于旧版 home 目录下的
+        node_library 文件夹中；选中该文件夹即可把其中的 .cpio 及缩略图
+        重新导入到当前库。已存在（同名 .cpio）的组会被跳过。
+        """
+        src = QtWidgets.QFileDialog.getExistingDirectory(self, "选择要导入的文件夹")
+        if not src:
+            return
+        src = os.path.normpath(src)
+        if os.path.abspath(src) == os.path.abspath(self.root_path):
+            hou.ui.displayMessage("不能导入当前库自身。", severity=hou.severityType.Warning)
+            return
+
+        # 递归扫描源文件夹中的 .cpio 文件
+        found = []
+        for root, dirs, files in os.walk(src):
+            for f in files:
+                if f.endswith(".cpio"):
+                    found.append((root, f))
+        if not found:
+            hou.ui.displayMessage(
+                "所选文件夹中未检测到节点组（.cpio 文件）。", severity=hou.severityType.Warning
+            )
+            return
+
+        ret = hou.ui.displayMessage(
+            f"检测到 {len(found)} 个节点组，将导入到当前库（保留子目录结构，已存在的跳过）。是否继续？",
+            buttons=("导入", "取消"), default_choice=0,
+        )
+        if ret != 0:
+            return
+
+        imported = 0
+        skipped = 0
+        try:
+            for src_dir, filename in found:
+                file_id = filename[:-5]
+                rel_dir = os.path.relpath(src_dir, src)
+                target_dir = self.root_path if rel_dir == "." else os.path.join(self.root_path, rel_dir)
+                os.makedirs(target_dir, exist_ok=True)
+
+                dst_cpio = os.path.join(target_dir, filename)
+                if os.path.exists(dst_cpio):
+                    skipped += 1
+                    continue
+
+                shutil.copy2(os.path.join(src_dir, filename), dst_cpio)
+
+                # 缩略图（与 .cpio 同名 .png）
+                src_png = os.path.join(src_dir, file_id + ".png")
+                dst_png = os.path.join(target_dir, file_id + ".png")
+                if os.path.exists(src_png) and not os.path.exists(dst_png):
+                    shutil.copy2(src_png, dst_png)
+
+                # 元数据：优先读取源目录 .meta.json，否则由文件名生成
+                src_meta = self._read_meta_plain(src_dir)
+                entry = None
+                for g in src_meta.get("groups", []):
+                    if g.get("file", "").replace(".cpio", "") == file_id:
+                        entry = dict(g)
+                        entry["file"] = file_id
+                        break
+                if entry is None:
+                    entry = {
+                        "name": file_id,
+                        "file": file_id,
+                        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+
+                target_meta = self._load_meta(target_dir)
+                existing = {g.get("file") for g in target_meta.get("groups", [])}
+                if file_id not in existing:
+                    target_meta.setdefault("groups", []).append(entry)
+                    self._save_meta(target_dir, target_meta)
+                imported += 1
+        except Exception as e:
+            hou.ui.displayMessage(f"导入失败：{e}", severity=hou.severityType.Error)
+            return
+
+        self.refresh_tree()
+        self.status_bar.showMessage(f"导入完成：新增 {imported} 个，跳过 {skipped} 个", 5000)
 
     # ---------- 操作 ----------
     def create_folder(self):
@@ -1550,10 +1989,11 @@ class NodeLibraryPanel(QtWidgets.QWidget):
             menu.addSeparator()
             backup_action = menu.addAction("备份库")
             restore_action = menu.addAction("恢复库")
+            import_action = menu.addAction("导入库")
             menu.addSeparator()
             undo_action = menu.addAction("撤销 (Ctrl+Z)")
             redo_action = menu.addAction("恢复 (Ctrl+Y)")
-            action = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+            action = _qt_exec(menu, self.tree.viewport().mapToGlobal(pos))
             if action == screenshot_action:
                 self.capture_screenshot()
             elif action == new_folder_action:
@@ -1562,6 +2002,8 @@ class NodeLibraryPanel(QtWidgets.QWidget):
                 self.backup_library()
             elif action == restore_action:
                 self.restore_library()
+            elif action == import_action:
+                self.import_from_folder()
             elif action == undo_action:
                 self.undo()
             elif action == redo_action:
@@ -1596,7 +2038,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         menu.addSeparator()
         refresh_action = menu.addAction("刷新")
 
-        action = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+        action = _qt_exec(menu, self.tree.viewport().mapToGlobal(pos))
 
         if action == screenshot_action:
             self.capture_screenshot()
@@ -1775,7 +2217,7 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         recapture_action = menu.addAction("重新截图")
         delete_action = menu.addAction("删除截图")
-        action = menu.exec_(self.thumb_label.mapToGlobal(pos))
+        action = _qt_exec(menu, self.thumb_label.mapToGlobal(pos))
         if action == recapture_action:
             self.capture_screenshot()
         elif action == delete_action:
@@ -1944,7 +2386,7 @@ class ScreenCaptureOverlay(QtWidgets.QWidget):
         full_action = menu.addAction("全屏截图")
         menu.addSeparator()
         cancel_action = menu.addAction("取消")
-        action = menu.exec_(event.globalPos())
+        action = _qt_exec(menu, event.globalPos())
         if action == free_action:
             self._set_window_mode(False)
         elif action == win_action:
