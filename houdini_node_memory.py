@@ -17,7 +17,25 @@ import zipfile
 from datetime import datetime
 
 import hou
-from PySide2 import QtWidgets, QtCore, QtGui
+
+# Qt 绑定兼容：Houdini 20.5 的 Qt6 构建、21.0 及 22.0 使用 PySide6（Qt6），
+# 旧版本（≤20.0 及标准 20.5）使用 PySide2（Qt5）。优先尝试 PySide6，失败回退 PySide2。
+try:
+    from PySide6 import QtWidgets, QtCore, QtGui
+    QT_BINDING = "PySide6"
+except ImportError:
+    from PySide2 import QtWidgets, QtCore, QtGui
+    QT_BINDING = "PySide2"
+
+# Qt6 中 QShortcut 从 QtWidgets 移至 QtGui，此处统一引用，屏蔽版本差异
+QShortcut = QtGui.QShortcut if QT_BINDING == "PySide6" else QtWidgets.QShortcut
+
+
+def _qt_exec(widget, *args):
+    """兼容 Qt5/Qt6 的 exec 调用：Qt6 将 exec_ 更名为 exec。"""
+    if hasattr(widget, "exec"):
+        return widget.exec(*args)
+    return widget.exec_(*args)
 
 
 
@@ -610,17 +628,17 @@ class NodeLibraryPanel(QtWidgets.QWidget):
         self.tree.itemExpanded.connect(self.on_item_expanded_or_collapsed)
         self.tree.itemCollapsed.connect(self.on_item_expanded_or_collapsed)
 
-        undo_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
+        undo_shortcut = QShortcut(QtGui.QKeySequence("Ctrl+Z"), self)
         undo_shortcut.activated.connect(self.undo)
-        redo_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Y"), self)
+        redo_shortcut = QShortcut(QtGui.QKeySequence("Ctrl+Y"), self)
         redo_shortcut.activated.connect(self.redo)
 
         # 截图快捷键（可在 Houdini 中自行修改触发键位）
-        screenshot_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+A"), self)
+        screenshot_shortcut = QShortcut(QtGui.QKeySequence("Ctrl+Shift+A"), self)
         screenshot_shortcut.activated.connect(self.capture_screenshot)
 
         # 搜索框聚焦快捷键
-        search_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+F"), self)
+        search_shortcut = QShortcut(QtGui.QKeySequence("Ctrl+F"), self)
         search_shortcut.activated.connect(self._focus_search)
 
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
